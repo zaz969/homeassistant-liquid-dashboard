@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createLongLivedTokenAuth } from "home-assistant-js-websocket";
 import { normalizeLayout } from "../src/lib/dashboard";
 import { normalizeEntityHistory } from "../src/lib/home-assistant";
+import { extractDashboardEntityIds, widgetTypeForImportedEntity } from "../src/lib/dashboard-import";
 import { normalizeTheme } from "../src/lib/theme";
 import { createWidgetId } from "../src/lib/widget-id";
 import { normalizeIngressPath } from "../ingress-path.js";
@@ -100,12 +101,14 @@ test("dashboard schema accepts new card types with compatible entities", () => {
     { id: "123e4567-e89b-42d3-a456-426614174002", type: "calendar", entityId: "calendar.family" },
     { id: "123e4567-e89b-42d3-a456-426614174003", type: "chart", entityId: "sensor.indoor_temperature" },
     { id: "123e4567-e89b-42d3-a456-426614174004", type: "clock", entityId: "clock.local" },
+    { id: "123e4567-e89b-42d3-a456-426614174005", type: "script", entityId: "script.evening_lights" },
   ];
   assert.deepEqual(normalizeLayout({ version: 1, widgets }).widgets.map(({ type }) => type), [
     "weather",
     "calendar",
     "chart",
     "clock",
+    "script",
   ]);
   assert.throws(() =>
     normalizeLayout({
@@ -119,6 +122,46 @@ test("dashboard schema accepts new card types with compatible entities", () => {
       widgets: [{ ...widgets[3], entityId: "sensor.indoor_temperature" }],
     }),
   );
+});
+
+test("Lovelace YAML import extracts unique entity references from nested cards and service targets", () => {
+  const yaml = `
+views:
+  - badges:
+      - type: entity
+        entity: light.living_room
+    sections:
+      - cards:
+          - type: entities
+            entities:
+              - entity: sensor.indoor_temperature
+              - sensor.humidity
+              - script.evening_lights
+          - type: button
+            target:
+              entity_id: switch.coffee_machine
+            tap_action:
+              perform_action: button.press
+`;
+  const entityIds = extractDashboardEntityIds(yaml);
+
+  assert.equal(entityIds.length, 5);
+  assert.equal(new Set(entityIds).size, entityIds.length);
+  assert.ok(entityIds.includes("light.living_room"));
+  assert.ok(entityIds.includes("sensor.indoor_temperature"));
+  assert.ok(entityIds.includes("sensor.humidity"));
+  assert.ok(entityIds.includes("switch.coffee_machine"));
+  assert.ok(entityIds.includes("script.evening_lights"));
+  assert.ok(!entityIds.includes("button.press"));
+  assert.equal(entityIds.filter((entityId) => widgetTypeForImportedEntity(entityId) !== null).length, 5);
+  assert.equal(widgetTypeForImportedEntity("button.some_action"), null);
+  assert.equal(widgetTypeForImportedEntity("script.evening_lights"), "script");
+});
+
+test("Lovelace YAML import rejects empty or malformed input", () => {
+  assert.throws(() => extractDashboardEntityIds(" \n "));
+  assert.throws(() => extractDashboardEntityIds("views: ["));
+  assert.throws(() => extractDashboardEntityIds("x".repeat(500_001)));
 });
 
 test("widget IDs are valid UUIDs", () => {
@@ -314,6 +357,34 @@ test("control API rejects arbitrary entity domains and service names", async () 
   assert.deepEqual(await response.json(), {
     error: "Unsupported or invalid control request.",
   });
+});
+
+test("script controls accept only the fixed run-script action", async () => {
+  const { controlRoute } = await getRouteModules();
+  const invalidAction = await controlRoute.POST(
+    new Request("http://dashboard.test/api/control", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        entityId: "script.evening_lights",
+        action: "turn_on",
+        service: "turn_on",
+      }),
+    }),
+  );
+  assert.equal(invalidAction.status, 400);
+
+  const runScript = await controlRoute.POST(
+    new Request("http://dashboard.test/api/control", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        entityId: "script.nonexistent_test_script",
+        action: "run_script",
+      }),
+    }),
+  );
+  assert.notEqual(runScript.status, 400);
 });
 
 test("sensor history endpoint rejects invalid entity IDs", async () => {

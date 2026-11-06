@@ -35,6 +35,7 @@ const supportedDomains = new Set([
   "media_player",
   "weather",
   "calendar",
+  "script",
 ]);
 const publicAttributeNames = [
   "unit_of_measurement",
@@ -70,6 +71,10 @@ const publicAttributeNames = [
 ] as const;
 
 let connectionPromise: Promise<Connection> | undefined;
+let activeConnection: Connection | undefined;
+let connectionHealthTimer: ReturnType<typeof setInterval> | undefined;
+let disconnectedAt: number | null = null;
+let lastConnectionStatus: HaConnectionStatus = "connecting";
 let cachedEntities: HassEntities = {};
 let connectionStatus: HaConnectionStatus = "connecting";
 let connectionError: string | null = null;
@@ -115,8 +120,69 @@ function snapshot(): HaSnapshot {
 }
 
 function publish() {
+  if (lastConnectionStatus !== connectionStatus) {
+    lastConnectionStatus = connectionStatus;
+    console.info(`Home Assistant connection status: ${connectionStatus}`);
+  }
   const current = snapshot();
   for (const listener of listeners) listener(current);
+}
+
+function startConnectionHealthCheck(connection: Connection) {
+  if (connectionHealthTimer) clearInterval(connectionHealthTimer);
+  let healthCheckRunning = false;
+  const timer = setInterval(() => {
+    if (activeConnection !== connection) {
+      clearInterval(timer);
+      connectionHealthTimer = undefined;
+      return;
+    }
+
+    if (!connection.connected) {
+      disconnectedAt ??= Date.now();
+      if (Date.now() - disconnectedAt < 60_000) return;
+
+      connectionStatus = "disconnected";
+      connectionError = "Home Assistant is taking longer than usual to reconnect. Trying a fresh connection.";
+      publish();
+      disconnectedAt = Date.now();
+      activeConnection = undefined;
+      connectionPromise = undefined;
+      clearInterval(timer);
+      connectionHealthTimer = undefined;
+      connection.close();
+      void connect().catch((error: unknown) => {
+        console.error("Could not replace the stale Home Assistant connection", error);
+      });
+      return;
+    }
+
+    disconnectedAt = null;
+    if (healthCheckRunning) return;
+    healthCheckRunning = true;
+    let rejectPingTimeout: ((reason: Error) => void) | undefined;
+    const pingTimeout = new Promise<never>((_, reject) => {
+      rejectPingTimeout = reject;
+    });
+    const timeout = setTimeout(
+      () => rejectPingTimeout?.(new Error("Home Assistant ping timed out.")),
+      10_000,
+    );
+    void Promise.race([connection.ping(), pingTimeout])
+      .catch(() => {
+        if (activeConnection !== connection || !connection.connected) return;
+        connectionStatus = "disconnected";
+        connectionError = "Home Assistant stopped responding. Reconnecting.";
+        disconnectedAt = Date.now();
+        publish();
+        connection.reconnect(true);
+      })
+      .finally(() => {
+        clearTimeout(timeout);
+        healthCheckRunning = false;
+      });
+  }, 30_000);
+  connectionHealthTimer = timer;
 }
 
 function connectionErrorMessage(error: unknown) {
@@ -150,16 +216,22 @@ async function connect() {
       supervisorToken,
     );
     const connection = await createConnection({ auth, setupRetry: 1 });
+    activeConnection = connection;
     connection.addEventListener("ready", () => {
+      if (activeConnection !== connection) return;
+      disconnectedAt = null;
       connectionStatus = "connected";
       connectionError = null;
       publish();
     });
     connection.addEventListener("disconnected", () => {
+      if (activeConnection !== connection) return;
+      disconnectedAt ??= Date.now();
       connectionStatus = "disconnected";
       publish();
     });
     connection.addEventListener("reconnect-error", () => {
+      if (activeConnection !== connection) return;
       connectionStatus = "error";
       connectionError = "Home Assistant could not reconnect.";
       publish();
@@ -170,39 +242,23 @@ async function connect() {
     connectionStatus = "connected";
     connectionError = null;
     subscribeEntities(connection, (entities) => {
+      if (activeConnection !== connection) return;
       cachedEntities = entities;
       if (connection.connected) connectionStatus = "connected";
+      disconnectedAt = null;
       publish();
     });
-    let healthCheckRunning = false;
-    setInterval(() => {
-      if (healthCheckRunning || !connection.connected) return;
-      healthCheckRunning = true;
-      let rejectPingTimeout: ((reason: Error) => void) | undefined;
-      const pingTimeout = new Promise<never>((_, reject) => {
-        rejectPingTimeout = reject;
-      });
-      const timeout = setTimeout(
-        () => rejectPingTimeout?.(new Error("Home Assistant ping timed out.")),
-        10_000,
-      );
-      void Promise.race([connection.ping(), pingTimeout])
-        .catch(() => {
-          if (!connection.connected) return;
-          connectionStatus = "disconnected";
-          connectionError = "Home Assistant stopped responding. Reconnecting.";
-          publish();
-          connection.reconnect(true);
-        })
-        .finally(() => {
-          clearTimeout(timeout);
-          healthCheckRunning = false;
-        });
-    }, 30_000);
+    startConnectionHealthCheck(connection);
     publish();
     return connection;
   })().catch((error: unknown) => {
+    const failedConnection = activeConnection;
+    activeConnection = undefined;
     connectionPromise = undefined;
+    disconnectedAt = null;
+    if (connectionHealthTimer) clearInterval(connectionHealthTimer);
+    connectionHealthTimer = undefined;
+    failedConnection?.close();
     connectionStatus = "error";
     connectionError = connectionErrorMessage(error);
     publish();

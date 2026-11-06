@@ -64,6 +64,7 @@ import { Switch } from "@/components/ui/glass/switch";
 import type { DashboardLayout, DashboardWidget } from "@/lib/dashboard";
 import type { HaSnapshot, PublicEntity } from "@/lib/home-assistant";
 import { defaultTheme, themePresets, wallpaperPresets, type ThemeSettings } from "@/lib/theme";
+import { extractDashboardEntityIds, widgetTypeForImportedEntity } from "@/lib/dashboard-import";
 import { createWidgetId } from "@/lib/widget-id";
 import WallpaperCanvas from "@/components/wallpaper-canvas";
 import { CalendarCard, LocalClockCard, SensorChartCard, WeatherCard } from "@/components/widget-cards";
@@ -158,7 +159,8 @@ function widgetTypeFor(entity: PublicEntity): DashboardWidget["type"] | null {
     entity.domain === "climate" ||
     entity.domain === "media_player" ||
     entity.domain === "weather" ||
-    entity.domain === "calendar"
+    entity.domain === "calendar" ||
+    entity.domain === "script"
   ) {
     return entity.domain;
   }
@@ -178,6 +180,7 @@ const widgetOptions: Array<{
   { type: "media_player", label: "Media", description: "Playback and volume", entityLabel: "media player" },
   { type: "weather", label: "Weather", description: "Conditions and measurements", entityLabel: "weather" },
   { type: "calendar", label: "Calendar", description: "Current or upcoming event", entityLabel: "calendar" },
+  { type: "script", label: "Script", description: "Run a Home Assistant script", entityLabel: "script" },
   { type: "chart", label: "Chart", description: "24-hour sensor history", entityLabel: "sensor" },
   { type: "clock", label: "Clock", description: "Local time and date", entityLabel: "none" },
 ];
@@ -222,6 +225,12 @@ export default function HomeDashboard() {
   const [selectedEntity, setSelectedEntity] = useState("");
   const [widgetTitle, setWidgetTitle] = useState("");
   const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [dashboardYaml, setDashboardYaml] = useState("");
+  const [importPreview, setImportPreview] = useState<string[] | null>(null);
+  const [selectedImportEntities, setSelectedImportEntities] = useState<string[]>([]);
+  const [importError, setImportError] = useState("");
+  const [importMessage, setImportMessage] = useState("");
+  const [importing, setImporting] = useState(false);
   const [notice, setNotice] = useState("");
   const [clock, setClock] = useState("");
   const [conflict, setConflict] = useState<DashboardResponse | null>(null);
@@ -280,6 +289,25 @@ export default function HomeDashboard() {
 
     void load();
     const events = new EventSource(apiUrl("api/events"));
+    let snapshotRequestRunning = false;
+    const refreshSnapshot = async () => {
+      if (!active || snapshotRequestRunning) return;
+      snapshotRequestRunning = true;
+      try {
+        const latest = await requestJson<HaSnapshot>("api/entities");
+        if (active) setSnapshot(latest);
+      } catch {
+        if (active) {
+          setSnapshot((previous) => ({
+            ...previous,
+            status: "disconnected",
+            error: "Connection status could not be refreshed. Retrying.",
+          }));
+        }
+      } finally {
+        snapshotRequestRunning = false;
+      }
+    };
     events.onmessage = (event) => {
       try {
         if (active) updateSnapshot(JSON.parse(event.data) as HaSnapshot);
@@ -294,11 +322,21 @@ export default function HomeDashboard() {
             ? { ...previous, status: "disconnected" }
             : previous,
         );
+        void refreshSnapshot();
       }
     };
+    const refreshTimer = window.setInterval(() => void refreshSnapshot(), 30_000);
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") void refreshSnapshot();
+    };
+    window.addEventListener("online", refreshWhenVisible);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
 
     return () => {
       active = false;
+      window.clearInterval(refreshTimer);
+      window.removeEventListener("online", refreshWhenVisible);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
       events.close();
     };
   }, [updateSnapshot]);
@@ -341,6 +379,27 @@ export default function HomeDashboard() {
     () => snapshot.entities.filter((entity) => widgetTypeFor(entity) !== null),
     [snapshot.entities],
   );
+  const importCandidates = useMemo(
+    () => (importPreview ?? []).flatMap((entityId) => {
+      const entity = snapshot.entities.find((item) => item.entityId === entityId);
+      const type = widgetTypeForImportedEntity(entityId);
+      if (!entity || !type || dashboard.layout.widgets.some((widget) => widget.entityId === entityId)) {
+        return [];
+      }
+      return [{ entityId, entity, type }];
+    }),
+    [dashboard.layout.widgets, importPreview, snapshot.entities],
+  );
+  const alreadyImportedCount = (importPreview ?? []).filter((entityId) =>
+    dashboard.layout.widgets.some((widget) => widget.entityId === entityId),
+  ).length;
+  const unavailableImportCount = (importPreview ?? []).filter((entityId) =>
+    widgetTypeForImportedEntity(entityId) !== null &&
+    !snapshot.entities.some((entity) => entity.entityId === entityId),
+  ).length;
+  const unsupportedImportCount = (importPreview ?? []).filter((entityId) =>
+    widgetTypeForImportedEntity(entityId) === null,
+  ).length;
   const compatibleEntities = selectedWidgetType && selectedWidgetType !== "clock"
     ? entities.filter((entity) => entity.domain === entityDomainForWidget(selectedWidgetType))
     : [];
@@ -478,6 +537,81 @@ export default function HomeDashboard() {
         ),
       },
     }));
+  };
+
+  const analyzeDashboardYaml = () => {
+    setImportError("");
+    setImportMessage("");
+    try {
+      const entityIds = extractDashboardEntityIds(dashboardYaml);
+      setImportPreview(entityIds);
+      setSelectedImportEntities(entityIds.filter((entityId) => {
+        const available = snapshot.entities.some((entity) => entity.entityId === entityId);
+        const supported = widgetTypeForImportedEntity(entityId) !== null;
+        const alreadyAdded = dashboard.layout.widgets.some((widget) => widget.entityId === entityId);
+        return available && supported && !alreadyAdded;
+      }));
+      if (entityIds.length === 0) setImportMessage("No entity references were found in this YAML.");
+    } catch (error) {
+      setImportPreview(null);
+      setSelectedImportEntities([]);
+      setImportError(error instanceof Error ? error.message : "Could not analyze dashboard YAML.");
+    }
+  };
+
+  const importSelectedEntities = async () => {
+    const selected = importCandidates.filter((candidate) =>
+      selectedImportEntities.includes(candidate.entityId),
+    );
+    if (selected.length === 0) return;
+
+    const capacity = Math.max(0, 40 - dashboard.layout.widgets.length);
+    if (capacity === 0) {
+      setImportError("The dashboard has reached its 40-widget limit. Remove widgets before importing more.");
+      return;
+    }
+    const toImport = selected.slice(0, capacity);
+    const layout: DashboardLayout = {
+      ...dashboard.layout,
+      widgets: [
+        ...dashboard.layout.widgets,
+        ...toImport.map(({ entityId, type }) => ({
+          id: createWidgetId(),
+          type,
+          entityId,
+          width: 1 as const,
+          height: 1 as const,
+        })),
+      ],
+    };
+
+    setImporting(true);
+    setImportError("");
+    setImportMessage("");
+    try {
+      const saved = await requestJson<DashboardResponse>("api/dashboard", {
+        method: "PUT",
+        body: JSON.stringify({ revision: dashboard.revision, layout }),
+      });
+      setDashboard(saved);
+      setEditing(true);
+      setImportPreview(null);
+      setSelectedImportEntities([]);
+      setImportMessage(
+        `${toImport.length} widget${toImport.length === 1 ? "" : "s"} imported and saved. You can now reorder them in Edit mode.` +
+        (selected.length > toImport.length ? ` ${selected.length - toImport.length} more did not fit the 40-widget limit.` : ""),
+      );
+    } catch (error) {
+      const latest = (error as Error & { current?: DashboardResponse }).current;
+      if (latest) setDashboard(latest);
+      setImportError(
+        latest
+          ? "The dashboard changed on another device. Analyze the YAML again to refresh the import list."
+          : error instanceof Error ? error.message : "Could not import dashboard entities.",
+      );
+    } finally {
+      setImporting(false);
+    }
   };
 
   const saveTheme = async () => {
@@ -1018,6 +1152,18 @@ export default function HomeDashboard() {
             >
               Glass
             </Button>
+            <Button
+              type="button"
+              variant="outline"
+              id="settings-tab-import"
+              className="settings-tab"
+              role="tab"
+              aria-selected={activeSettingsTab === "import"}
+              aria-controls="settings-panel-import"
+              onClick={() => setActiveSettingsTab("import")}
+            >
+              Import
+            </Button>
           </div>
           <section
             className="settings-panel"
@@ -1310,6 +1456,97 @@ export default function HomeDashboard() {
               </Button>
             </div>
           </section>
+          <section
+            className="settings-panel import-settings"
+            id="settings-panel-import"
+            role="tabpanel"
+            aria-labelledby="settings-tab-import"
+            hidden={activeSettingsTab !== "import"}
+          >
+            <h3>Import Home Assistant dashboard</h3>
+            <p className="settings-description">
+              Paste a Lovelace dashboard YAML export. We’ll find supported entities, skip widgets already here,
+              and create one widget per remaining entity.
+            </p>
+            <label className="import-yaml-label" htmlFor="dashboard-yaml-input">Dashboard YAML</label>
+            <textarea
+              id="dashboard-yaml-input"
+              className="import-yaml-input"
+              value={dashboardYaml}
+              maxLength={500_000}
+              placeholder={"views:\n  - title: Home\n    cards:\n      - type: entities\n        entities:\n          - light.living_room"}
+              spellCheck={false}
+              onChange={(event) => {
+                setDashboardYaml(event.target.value);
+                setImportPreview(null);
+                setSelectedImportEntities([]);
+                setImportError("");
+                setImportMessage("");
+              }}
+            />
+            <div className="import-actions">
+              <span className="import-size">{dashboardYaml.length.toLocaleString()} / 500,000 characters</span>
+              <Button type="button" variant="outline" onClick={analyzeDashboardYaml}>
+                Analyze YAML
+              </Button>
+            </div>
+            {importError && <p className="import-feedback is-error" role="alert">{importError}</p>}
+            {importMessage && <p className="import-feedback" role="status">{importMessage}</p>}
+            {importPreview !== null && (
+              <div className="import-preview">
+                <div className="import-summary">
+                  <strong>{importCandidates.length} new supported widget{importCandidates.length === 1 ? "" : "s"} found</strong>
+                  <span>{alreadyImportedCount} already on this dashboard</span>
+                  {(unavailableImportCount > 0 || unsupportedImportCount > 0) && (
+                    <span>
+                      {unavailableImportCount + unsupportedImportCount} skipped
+                      {unsupportedImportCount > 0 ? ` (${unsupportedImportCount} unsupported)` : ""}
+                      {unavailableImportCount > 0 ? ` (${unavailableImportCount} not available in Home Assistant)` : ""}
+                    </span>
+                  )}
+                </div>
+                {importCandidates.length > 0 ? (
+                  <>
+                    <div className="import-candidate-list" aria-label="Entities to import">
+                      {importCandidates.map(({ entityId, entity, type }) => (
+                        <label className="import-candidate" key={entityId}>
+                          <input
+                            className="import-checkbox"
+                            type="checkbox"
+                            checked={selectedImportEntities.includes(entityId)}
+                            onChange={(event) => {
+                              setSelectedImportEntities((current) =>
+                                event.target.checked
+                                  ? [...current, entityId]
+                                  : current.filter((id) => id !== entityId),
+                              );
+                            }}
+                          />
+                          <span className="import-candidate-name">{entity.name}</span>
+                          <code>{entityId}</code>
+                          <span className="import-candidate-type">{type.replace("_", " ")}</span>
+                        </label>
+                      ))}
+                    </div>
+                    <div className="import-actions import-commit-row">
+                      <span>
+                        {Math.max(0, 40 - dashboard.layout.widgets.length)} of 40 widget slots available
+                      </span>
+                      <Button
+                        type="button"
+                        onClick={() => void importSelectedEntities()}
+                        disabled={importing || selectedImportEntities.length === 0 || dashboard.layout.widgets.length >= 40}
+                      >
+                        {importing ? "Importing…" : `Import ${selectedImportEntities.length} selected`}
+                      </Button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="import-empty">No new supported entities are ready to import.</p>
+                )}
+              </div>
+            )}
+          </section>
         </div>
       </dialog>
     </main>
@@ -1460,6 +1697,28 @@ function WidgetBody({
             />
           </div>
         </div>
+      </div>
+    );
+  }
+
+  if (widget.type === "script") {
+    return (
+      <div className="script-content">
+        <div className="widget-topline">
+          <span className="widget-icon script-icon"><Play size={19} /></span>
+          <span className="sensor-caption">SCRIPT</span>
+          {pendingControl}
+        </div>
+        <p className="widget-title">{title}</p>
+        <Button
+          type="button"
+          className="script-run-control"
+          disabled={editing || pending || !connected}
+          onClick={() => onAction("run_script")}
+        >
+          {pending ? <LoaderCircle className="spin" size={18} /> : <Play size={18} />}
+          <span>{pending ? "Running…" : "Run script"}</span>
+        </Button>
       </div>
     );
   }

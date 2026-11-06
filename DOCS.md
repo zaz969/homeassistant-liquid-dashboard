@@ -21,6 +21,7 @@ Available card types:
 
 - Lights: on/off and brightness.
 - Switches: on/off.
+- Scripts: run an existing Home Assistant script.
 - Sensors: state and unit, with an optional 24-hour chart.
 - Climate: current/target temperature and supported HVAC modes.
 - Media players: play/pause and volume.
@@ -30,8 +31,9 @@ Available card types:
 - Clock: local time and date; no entity required.
 
 Charts use Home Assistant's history WebSocket API. Calendar cards require an
-integration that supports `calendar.get_events`. Camera streams, locks, alarms,
-covers, and arbitrary service calls are not included.
+integration that supports `calendar.get_events`. Script buttons run only the
+selected script entity; arbitrary service calls are not exposed. Camera
+streams, locks, alarms, and covers are not included.
 
 ## Install as a local Home Assistant app/add-on
 
@@ -152,6 +154,13 @@ Choose **Glass** to tune widget transparency and the strength of the animated
 edge reflections. Changes preview immediately and are saved with **Save
 settings**.
 
+Choose **Import** to paste a Lovelace dashboard YAML export, analyze it, and
+select supported Home Assistant entities that do not already have widgets.
+Unsupported domains and supported entities unavailable in Home Assistant are
+skipped. Imports are saved to the shared dashboard immediately; enter Edit mode
+to reorder the new cards. Dashboard imports are limited by the 40-widget
+maximum.
+
 In dashboard edit mode, drag a card by its grip to reorder it; neighboring
 cards animate as it moves. Keyboard users can focus the grip and use the arrow
 keys. A sensor card can switch between its reading and a history chart from its
@@ -177,7 +186,10 @@ Confirm the app is installed and running under Supervisor with
 `homeassistant_api: true`. Check the app log for startup errors. Do not copy a
 user token into the app; the Supervisor injects the required token. The app
 retries dropped WebSocket connections and periodically checks for stale
-connections while the dashboard is open.
+connections while the dashboard is open. If a socket remains disconnected for
+one minute, the app replaces it with a fresh connection. The dashboard also
+refreshes its connection snapshot periodically and when the page becomes
+visible again.
 
 ### Ingress returns an error or the page has missing styles
 
@@ -196,9 +208,9 @@ your version from the conflict prompt.
 ### Some entities are not available as widgets
 
 Only visible `light`, `switch`, `sensor`, `climate`, `media_player`, `weather`,
-and `calendar` entities are supported. In Edit mode, first choose a card type,
-then select a compatible entity. Charts use numeric `sensor` entities; clock
-cards do not require a Home Assistant entity.
+`calendar`, and `script` entities are supported. In Edit mode, first choose a
+card type, then select a compatible entity. Charts use numeric `sensor`
+entities; clock cards do not require a Home Assistant entity.
 
 ### Sensor charts show no history
 

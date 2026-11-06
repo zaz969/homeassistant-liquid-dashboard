@@ -10,6 +10,7 @@ const widgetTypeSchema = z.enum([
   "calendar",
   "chart",
   "clock",
+  "script",
 ]);
 
 export const widgetSchema = z.object({

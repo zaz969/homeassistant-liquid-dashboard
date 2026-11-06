@@ -31,6 +31,10 @@ const controlSchema = z.discriminatedUnion("action", [
     action: z.literal("volume"),
     value: z.number().min(0).max(1),
   }),
+  z.object({
+    entityId: z.string().regex(/^script\.[a-z0-9_]+$/),
+    action: z.literal("run_script"),
+  }),
 ]);
 
 export async function POST(request: Request) {
@@ -111,6 +115,12 @@ export async function POST(request: Request) {
       case "volume":
         service = "volume_set";
         serviceData = { volume_level: body.value };
+        break;
+      case "run_script":
+        if (domain !== "script") {
+          return NextResponse.json({ error: "Only script entities can be run by this control." }, { status: 400 });
+        }
+        service = "turn_on";
         break;
     }
 
